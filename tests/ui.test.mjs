@@ -1,0 +1,26 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import {Window} from 'happy-dom';
+test('assignment controls, checklist persistence, filters and settings work together',async()=>{
+ const w=new Window({url:'https://planner.example/'});w.document.write(await fs.readFile(new URL('../dist/index.html',import.meta.url),'utf8'));
+ for(const key of ['document','window','location','history','localStorage','navigator','FormData','Event'])Object.defineProperty(globalThis,key,{value:key==='window'?w:w[key],configurable:true});
+ globalThis.addEventListener=w.addEventListener.bind(w);globalThis.confirm=()=>true;globalThis.prompt=()=> '1.5';
+ await import('../dist/app.mjs');
+ const $=s=>w.document.querySelector(s);const event=type=>new w.Event(type,{bubbles:true,cancelable:true});
+ assert.match($('#task-list').textContent,/fresh start/);
+ $('#add').click();assert.equal($('#editor').open,true);
+ const f=$('#task-form');f.elements.title.value='Biology report';f.elements.module.value='BIOL1001';f.elements.dueLocal.value='2026-11-12T15:00';f.elements.estimate.value='12';f.elements.steps.value='Read brief\nWrite report\nSubmit';f.dispatchEvent(event('submit'));
+ assert.equal($('#editor').open,false);assert.equal($('.task h3').textContent,'Biology report');assert.equal(JSON.parse(localStorage.getItem('module-planner:v1')).tasks[0].steps.length,3);
+ $('article details').open=true;const step=$('[data-action="step"]');step.checked=true;step.dispatchEvent(event('change'));assert.match($('article').textContent,/33%/);
+ $('[data-action="log"]').click();assert.match($('article').textContent,/10.5h remaining/);
+ $('[data-action="edit"]').click();f.elements.title.value='Revised report';f.dispatchEvent(event('submit'));assert.equal($('article h3').textContent,'Revised report');assert.equal($('[data-action="step"]').checked,true);
+ const done=$('[data-action="complete"]');done.checked=true;done.dispatchEvent(event('change'));assert.equal($('article'),null);$('#status-filter').value='completed';$('#status-filter').dispatchEvent(event('change'));assert.equal($('[data-action="complete"]').checked,true);
+ $('#search').value='unrelated';$('#search').dispatchEvent(event('input'));assert.equal($('article'),null);$('#search').value='';$('#search').dispatchEvent(event('input'));
+ $('[data-view="plan"]').click();assert.equal($('#plan').hidden,false);assert.match($('#plan').textContent,/next 14 days/);
+ $('[data-view="settings"]').click();assert($('#github-form'));assert($('#capacity-form'));assert.match($('#settings').textContent,/Generate new token/);
+ const c=$('#capacity-form');c.elements.dailyHours.value='3';c.dispatchEvent(event('submit'));assert.equal(JSON.parse(localStorage.getItem('module-planner:v1')).settings.dailyHours,3);
+ $('[data-view="assignments"]').click();$('[data-action="duplicate"]').click();assert.equal(JSON.parse(localStorage.getItem('module-planner:v1')).tasks.length,2);
+ $('#status-filter').value='all';$('#status-filter').dispatchEvent(event('change'));$('[data-action="delete"]').click();assert.equal(JSON.parse(localStorage.getItem('module-planner:v1')).tasks.length,1);$('#toast button').click();assert.equal(JSON.parse(localStorage.getItem('module-planner:v1')).tasks.length,2);
+ await w.happyDOM.close();
+});
