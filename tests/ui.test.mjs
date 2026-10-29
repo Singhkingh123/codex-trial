@@ -22,5 +22,7 @@ test('assignment controls, checklist persistence, filters and settings work toge
  const c=$('#capacity-form');c.elements.dailyHours.value='3';c.dispatchEvent(event('submit'));assert.equal(JSON.parse(localStorage.getItem('module-planner:v1')).settings.dailyHours,3);
  $('[data-view="assignments"]').click();$('[data-action="duplicate"]').click();assert.equal(JSON.parse(localStorage.getItem('module-planner:v1')).tasks.length,2);
  $('#status-filter').value='all';$('#status-filter').dispatchEvent(event('change'));$('[data-action="delete"]').click();assert.equal(JSON.parse(localStorage.getItem('module-planner:v1')).tasks.length,1);$('#toast button').click();assert.equal(JSON.parse(localStorage.getItem('module-planner:v1')).tasks.length,2);
+ const changed=JSON.parse(localStorage.getItem('module-planner:v1'));changed.tasks[0].title='Newer tab data';localStorage.setItem('module-planner:v1',JSON.stringify(changed));
+ $('[data-action="edit"]').click();f.elements.title.value='Stale edit';f.dispatchEvent(event('submit'));assert.match($('#form-error').textContent,/Another tab/);assert.equal(JSON.parse(localStorage.getItem('module-planner:v1')).tasks[0].title,'Newer tab data');
  await w.happyDOM.close();
 });
