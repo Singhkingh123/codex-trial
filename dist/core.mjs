@@ -1,3 +1,4 @@
+import {stepsFor,nextStep} from './guidance.mjs';
 export const VERSION=1;
 export const defaults={dailyHours:2,bufferDays:1,weekends:true,zone:'Europe/London'};
 export const uid=()=>crypto.randomUUID();
@@ -6,7 +7,7 @@ export const safeURL=s=>{try{const u=new URL(s);return ['https:','http:'].includ
 export function emptyData(){return {version:VERSION,tasks:[],deleted:{},settings:{...defaults}};}
 export function estimateHours(type,words=0,difficulty=1){const base={essay:10,report:14,problem:6,coding:20,presentation:8,exam:24,other:8};let h=base[type]||8;if(words>0&&['essay','report'].includes(type))h=4+Number(words)/180;h=Math.ceil(h*Number(difficulty)*4)/4;return {hours:h,low:Math.round(h*.75*4)/4,high:Math.round(h*1.5*4)/4};}
 export const remaining=t=>t.status==='completed'?0:Math.max(0,t.estimate-(t.logs||[]).reduce((a,l)=>a+l.hours,0));
-export const progress=t=>t.status==='completed'?100:t.steps.length?Math.round(t.steps.filter(s=>s.done).length/t.steps.length*100):Math.min(99,Math.round((t.estimate-remaining(t))/t.estimate*100));
+export const progress=t=>t.status==='completed'?100:stepsFor(t).length?Math.round(stepsFor(t).filter(s=>s.done).length/stepsFor(t).length*100):Math.min(99,Math.round((t.estimate-remaining(t))/t.estimate*100));
 export function dayKey(d=new Date(),zone='Europe/London'){const parts=new Intl.DateTimeFormat('en-GB',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(d));return ['year','month','day'].map(k=>parts.find(p=>p.type===k).value).join('-');}
 export function localInput(iso,zone){if(!iso)return '';return new Intl.DateTimeFormat('sv-SE',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date(iso)).replace(' ','T');}
 export function zonedISO(value,zone='Europe/London'){
@@ -17,12 +18,19 @@ export function zonedISO(value,zone='Europe/London'){
  if(localInput(new Date(guess).toISOString(),zone)!==value)throw Error('That time does not exist in this time zone (clock change). Choose another time.');
  return new Date(guess).toISOString();
 }
-export function priority(t,settings,now=Date.now()){
- if(t.status==='completed')return 'low';if(t.priority!=='auto')return t.priority;if(!t.due)return 'low';
- const days=(Date.parse(t.due)-now)/86400000;const needed=remaining(t)/settings.dailyHours+settings.bufferDays;
- return days<=Math.max(2,needed)?'high':days<=Math.max(7,needed+3)?'medium':'low';
+export function assignmentWindow(t,now=Date.now()){
+ const due=t.due?Date.parse(t.due):null;
+ const given=t.given?Date.parse(zonedISO(t.given+'T00:00',t.zone)):null;
+ const status=t.status==='completed'?'completed':given===null||due===null?'needs-dates':now>=due?'overdue':now<given?'upcoming':'active';
+ return {given,due,status};
 }
-export function suggestedStart(t,settings){if(!t.due)return '';let date=new Date(dayKey(t.due,t.zone)+'T12:00:00Z');let days=Math.ceil(remaining(t)/settings.dailyHours)+settings.bufferDays;while(days>0){date.setUTCDate(date.getUTCDate()-1);if(settings.weekends||![0,6].includes(date.getUTCDay()))days--;}return date.toISOString().slice(0,10);}
+export function priority(t,settings,now=Date.now()){
+ const w=assignmentWindow(t,now);if(['completed','needs-dates','upcoming'].includes(w.status))return 'low';
+ if(w.status==='overdue')return 'high';const left=(w.due-now)/86400000,ratio=(w.due-now)/(w.due-w.given);
+ return left<=2||ratio<=.25?'high':ratio<=.5?'medium':'low';
+}
+// Retained API for older integrations: there is no separate calculated start date.
+export function suggestedStart(t){return t.given||'';}
 export function validateData(data){
  if(!data||typeof data!=='object'||data.version!==1||!Array.isArray(data.tasks)||data.tasks.length>10000)throw Error('Expected a Module Planner v1 backup with no more than 10,000 assignments.');
  const seen=new Set();const tasks=data.tasks.map(t=>{
@@ -31,23 +39,42 @@ export function validateData(data){
   const num=Number(t.estimate);if(!Number.isFinite(num)||num<.25||num>10000)throw Error('Estimated hours must be between 0.25 and 10,000.');
   if(t.due&&(!Number.isFinite(Date.parse(t.due))||!/(Z|[+-]\d\d:\d\d)$/.test(t.due)))throw Error('Deadlines must include a time zone offset.');
   const zone=t.zone||defaults.zone;new Intl.DateTimeFormat('en',{timeZone:zone}).format();
-  const steps=(t.steps||[]).map((s,i)=>{if(!s||typeof s.text!=='string'||s.text.length>500)throw Error('Invalid checklist item.');return {id:typeof s.id==='string'?s.id:'step-'+i,text:s.text,done:!!s.done};});
+  const given=t.given||'';if(given){if(!/^\d{4}-\d\d-\d\d$/.test(given))throw Error('Date given must be YYYY-MM-DD.');zonedISO(given+'T00:00',zone);if(t.due&&given>dayKey(t.due,zone))throw Error('The date given cannot be after the assignment deadline.');if(t.due&&Date.parse(zonedISO(given+'T00:00',zone))===Date.parse(t.due))throw Error('Deadline must be later than the start of the given date.');}
+  const cleanLinks=list=>(Array.isArray(list)?list:[]).slice(0,30).filter(l=>l&&safeURL(l.url)).map(l=>({label:String(l.label||l.url).slice(0,200),url:safeURL(l.url)}));
+  const steps=(t.steps||[]).map((s,i)=>{if(!s||typeof s.text!=='string'||s.text.length>500)throw Error('Invalid checklist item.');return {id:typeof s.id==='string'?s.id:'step-'+i,text:s.text,done:!!s.done,...(s.detail?{detail:String(s.detail).slice(0,3000)}:{}),...(s.links?{links:cleanLinks(s.links)}:{})};});
   const logs=(t.logs||[]).map(l=>{if(!l||!Number.isFinite(Number(l.hours))||l.hours<=0||l.hours>10000||!Number.isFinite(Date.parse(l.at)))throw Error('Invalid study log.');return {id:l.id||uid(),hours:Number(l.hours),at:l.at};});
-  return {id:t.id,title:t.title.trim(),module:t.module.trim(),due:t.due?new Date(t.due).toISOString():'',zone,type:['essay','report','problem','coding','presentation','exam','other'].includes(t.type)?t.type:'other',estimate:num,words:Math.max(0,Number(t.words)||0),difficulty:[.75,1,1.5].includes(Number(t.difficulty))?Number(t.difficulty):1,weight:t.weight==null||t.weight===''?'':Math.min(100,Math.max(0,Number(t.weight)||0)),priority:['auto','high','medium','low'].includes(t.priority)?t.priority:'auto',status:['not-started','in-progress','completed'].includes(t.status)?t.status:'not-started',source:safeURL(t.source),notes:String(t.notes||'').slice(0,20000),steps,logs,updatedAt:Number.isFinite(Date.parse(t.updatedAt))?t.updatedAt:new Date().toISOString(),...(t.importKey?{importKey:String(t.importKey).slice(0,500)}:{})};
+  return {id:t.id,title:t.title.trim(),module:t.module.trim(),given,resources:cleanLinks(t.resources),due:t.due?new Date(t.due).toISOString():'',zone,type:['essay','report','problem','coding','presentation','exam','other'].includes(t.type)?t.type:'other',estimate:num,words:Math.max(0,Number(t.words)||0),difficulty:[.75,1,1.5].includes(Number(t.difficulty))?Number(t.difficulty):1,weight:t.weight==null||t.weight===''?'':Math.min(100,Math.max(0,Number(t.weight)||0)),priority:['auto','high','medium','low'].includes(t.priority)?t.priority:'auto',status:['not-started','in-progress','completed'].includes(t.status)?t.status:'not-started',source:safeURL(t.source),notes:String(t.notes||'').slice(0,20000),steps,logs,updatedAt:Number.isFinite(Date.parse(t.updatedAt))?t.updatedAt:new Date().toISOString(),...(t.importKey?{importKey:String(t.importKey).slice(0,500)}:{})};
  });
  const s=data.settings||{};const settings={dailyHours:Math.min(16,Math.max(.25,Number(s.dailyHours)||2)),bufferDays:Math.min(14,Math.max(0,Number(s.bufferDays??1))),weekends:s.weekends!==false,zone:s.zone||defaults.zone};
  new Intl.DateTimeFormat('en',{timeZone:settings.zone}).format();const deleted={};for(const [id,at] of Object.entries(data.deleted||{})){if(typeof at==='string'&&Number.isFinite(Date.parse(at)))deleted[id]=at;}
  return {version:1,tasks,settings,deleted};
 }
+const addDay=(key,n=1)=>{const d=new Date(key+'T12:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);};
 export function planStudy(data,now=new Date(),horizon=14){
- const {settings}=data;const today=dayKey(now,settings.zone);const pending=data.tasks.filter(t=>t.status!=='completed'&&remaining(t)>0).sort((a,b)=>(Date.parse(a.due)||Infinity)-(Date.parse(b.due)||Infinity));
- const rest=new Map(pending.map(t=>[t.id,remaining(t)]));const days=[];const warnings=[];
- for(let i=0;i<horizon;i++){const d=new Date(today+'T12:00:00Z');d.setUTCDate(d.getUTCDate()+i);const date=d.toISOString().slice(0,10);let capacity=settings.weekends||![0,6].includes(d.getUTCDay())?settings.dailyHours:0;const blocks=[];
-  for(const t of pending){if(capacity<=0)break;const rem=rest.get(t.id);if(rem<=0)continue;const h=Math.min(capacity,rem);blocks.push({task:t,hours:h,late:!!t.due&&date>=dayKey(t.due,t.zone)});rest.set(t.id,Math.max(0,rem-h));capacity=Math.max(0,capacity-h);}
-  days.push({date,blocks,capacity});
+ const time=Number(now),zone=data.settings.zone,today=dayKey(now,zone);
+ const days=Array.from({length:horizon},(_,i)=>({date:addDay(today,i),blocks:[],capacity:0}));
+ const byDate=new Map(days.map(d=>[d.date,d]));const warnings=[],needsDates=[],overdue=[],unallocated=[];
+ const tasks=data.tasks.filter(t=>t.status!=='completed').sort((a,b)=>(Date.parse(a.due)||Infinity)-(Date.parse(b.due)||Infinity));
+ for(const t of tasks){
+  const w=assignmentWindow(t,time);if(w.status==='needs-dates'){needsDates.push(t);continue;}if(w.status==='overdue'){overdue.push(t);continue;}
+  const begin=Math.max(time,w.given),rem=remaining(t);const first=dayKey(begin,t.zone);let last=dayKey(w.due,t.zone);
+  if(Date.parse(zonedISO(last+'T00:00',t.zone))===w.due)last=addDay(last,-1);
+  const totalDays=Math.max(1,Math.round((Date.parse(last+'T12:00:00Z')-Date.parse(first+'T12:00:00Z'))/86400000)+1);
+  const pending=stepsFor(t).filter(s=>!s.done);if(!pending.length)pending.push(nextStep(t));
+  if(rem>(w.due-begin)/3600000)warnings.push(`${t.title}: the remaining estimate exceeds the entire time left before the deadline. Review the estimate and seek support if needed.`);
+  let allocated=0;
+  for(let i=0;i<Math.min(totalDays,horizon+2);i++){
+   const date=addDay(first,i),start=Math.max(begin,Date.parse(zonedISO(date+'T00:00',t.zone))),end=Math.min(w.due,Date.parse(zonedISO(addDay(date)+'T00:00',t.zone)));
+   if(end<=start)continue;const row=byDate.get(dayKey(start,zone));if(!row)continue;
+   const items=[];for(let j=0;j<pending.length;j++){const share=Math.min((i+1)/totalDays,(j+1)/pending.length)-Math.max(i/totalDays,j/pending.length);if(share>1e-12)items.push({step:pending[j],hours:rem*share,continued:i/totalDays>j/pending.length});}
+   const h=items.reduce((sum,item)=>sum+item.hours,0);allocated+=h;
+   row.blocks.push({task:t,hours:h,items,start:new Date(start).toISOString(),end:new Date(end).toISOString(),late:false});
+   if(h>(end-start)/3600000)warnings.push(`${t.title} on ${date}: the estimated work is longer than the available window. This is a workload warning, not an extension of your deadline.`);
+   if(rem===0)break;
+  }
+  if(rem-allocated>.001)unallocated.push({task:t,hours:rem-allocated});
  }
- for(const t of pending){if(!t.due){warnings.push(`${t.title}: no deadline — add one to check feasibility.`);continue;}const dueKey=dayKey(t.due,t.zone);const all=days.flatMap(d=>d.blocks.filter(b=>b.task.id===t.id).map(b=>({date:d.date,...b})));const before=all.filter(b=>b.date<dueKey).reduce((n,b)=>n+b.hours,0);if(before<remaining(t)&&dueKey<=days.at(-1).date)warnings.push(`${t.title}: ${(remaining(t)-before).toFixed(1)}h cannot fit before the deadline day. Increase study capacity, start earlier, or review the estimate.`);}
- return {days,warnings,unallocated:pending.filter(t=>rest.get(t.id)>.01).map(t=>({task:t,hours:rest.get(t.id)}))};
+ return {days,warnings,needsDates,overdue,unallocated};
 }
 function canonical(v){if(v===undefined)return 'undefined';if(v===null||typeof v!=='object')return JSON.stringify(v);if(Array.isArray(v))return '['+v.map(canonical).join(',')+']';return '{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+canonical(v[k])).join(',')+'}';}
 export function mergeData(local,remote,base=null){
@@ -61,7 +88,7 @@ export function mergeData(local,remote,base=null){
  return {version:1,tasks,deleted,settings};
 }
 export function csvRows(text){const rows=[];let row=[],cell='',quoted=false;for(let i=0;i<text.length;i++){const c=text[i];if(c==='"'){if(quoted&&text[i+1]==='"'){cell+='"';i++;}else if(!quoted&&cell.length||quoted&&text[i+1]&&!['\r','\n',','].includes(text[i+1]))throw Error('Malformed CSV quotes.');else quoted=!quoted;}else if(c===','&&!quoted){row.push(cell);cell='';}else if((c==='\n'||c==='\r')&&!quoted){if(c==='\r'&&text[i+1]==='\n')i++;row.push(cell);if(row.some(x=>x.trim()))rows.push(row);row=[];cell='';}else cell+=c;}if(quoted)throw Error('Unclosed CSV quote.');row.push(cell);if(row.some(x=>x.trim()))rows.push(row);return rows;}
-export function importedTask(o){const zone=o.zone||defaults.zone;let due=o.due||'';if(due&&!/(Z|[+-]\d\d:\d\d)$/.test(due))due=zonedISO(due.slice(0,16),zone);return {id:o.id||uid(),title:o.title,module:o.module||'Imported · review module',due,zone,type:o.type||'other',estimate:Number(o.estimate)||8,status:'not-started',priority:'auto',steps:[],logs:[],notes:o.notes||'',source:safeURL(o.source),updatedAt:new Date().toISOString(),...(o.importKey?{importKey:o.importKey}:{})};}
+export function importedTask(o){const zone=o.zone||defaults.zone;let due=o.due||'';if(due&&!/(Z|[+-]\d\d:\d\d)$/.test(due))due=zonedISO(due.slice(0,16),zone);return {id:o.id||uid(),title:o.title,module:o.module||'Imported · review module',given:o.given||'',resources:o.resources||[],due,zone,type:o.type||'other',estimate:Number(o.estimate)||8,status:'not-started',priority:'auto',steps:[],logs:[],notes:o.notes||'',source:safeURL(o.source),updatedAt:new Date().toISOString(),...(o.importKey?{importKey:o.importKey}:{})};}
 export function importCSV(text){const [headers,...rows]=csvRows(text.replace(/^\uFEFF/,''));if(!headers?.includes('title')||!headers.includes('module'))throw Error('CSV needs title and module headers.');return validateData({...emptyData(),tasks:rows.map(row=>importedTask(Object.fromEntries(headers.map((h,i)=>[h.trim(),row[i]||'']))))}).tasks;}
 const icsUnescape=s=>s.replace(/\\n/gi,'\n').replace(/\\([,;\\])/g,'$1');
 export function importICS(text){
@@ -73,11 +100,11 @@ export function importICS(text){
   catch{warnings.push(`Skipped ${summary}: unsupported date/time zone.`);continue;}
   const key=get('UID')?.[1];const title=icsUnescape(summary);tasks.push(importedTask({title,due,zone,notes:icsUnescape(get('DESCRIPTION')?.[1]||''),source:icsUnescape(get('URL')?.[1]||''),...(key?{importKey:'ics:'+key}:{})}));
  }
- if(!tasks.length)throw Error('No usable non-recurring calendar events found.');return {tasks:validateData({...emptyData(),tasks}).tasks,warnings};
+ if(!tasks.length)throw Error('No usable non-recurring calendar events found.');warnings.push('Date given is not supplied by calendar deadlines. Add the actual release date from the assessment brief to enable planning.');return {tasks:validateData({...emptyData(),tasks}).tasks,warnings};
 }
 function icsEscape(s){return String(s).replace(/\\/g,'\\\\').replace(/\r?\n/g,'\\n').replace(/,/g,'\\,').replace(/;/g,'\\;');}
 function foldLine(line){const chunks=[];let chunk='',size=0;for(const char of line){const bytes=new TextEncoder().encode(char).length;if(size+bytes>74){chunks.push(chunk);chunk=' ';size=1;}chunk+=char;size+=bytes;}chunks.push(chunk);return chunks.join('\r\n');}
-export function exportICS(tasks){const stamp=d=>new Date(d).toISOString().replace(/[-:]/g,'').split('.')[0]+'Z';const lines=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Module Planner//Assignments//EN','CALSCALE:GREGORIAN'];for(const t of tasks.filter(t=>t.due&&t.status!=='completed')){lines.push('BEGIN:VEVENT',`UID:${icsEscape(t.id)}@module-planner`,`DTSTAMP:${stamp(new Date())}`,`DTSTART:${stamp(t.due)}`,`SUMMARY:${icsEscape(t.module+' · '+t.title)}`,`DESCRIPTION:${icsEscape(t.notes+'\nEstimated total: '+t.estimate+' hours')}`,...(safeURL(t.source)?['URL:'+safeURL(t.source)]:[]),'BEGIN:VALARM','TRIGGER:-P1D','ACTION:DISPLAY','DESCRIPTION:Assignment due tomorrow','END:VALARM','END:VEVENT');}lines.push('END:VCALENDAR');return lines.map(foldLine).join('\r\n')+'\r\n';}
+export function exportICS(tasks){const stamp=d=>new Date(d).toISOString().replace(/[-:]/g,'').split('.')[0]+'Z';const lines=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Module Planner//Assignments//EN','CALSCALE:GREGORIAN'];for(const t of tasks.filter(t=>t.due&&t.status!=='completed')){lines.push('BEGIN:VEVENT',`UID:${icsEscape(t.id)}@module-planner`,`DTSTAMP:${stamp(new Date())}`,`DTSTART:${stamp(t.due)}`,`SUMMARY:${icsEscape(t.module+' · '+t.title)}`,`DESCRIPTION:${icsEscape((t.given?'Given on: '+t.given+'\n':'')+t.notes+'\nEstimated total: '+t.estimate+' hours')}`,...(safeURL(t.source)?['URL:'+safeURL(t.source)]:[]),'BEGIN:VALARM','TRIGGER:-P1D','ACTION:DISPLAY','DESCRIPTION:Assignment due tomorrow','END:VALARM','END:VEVENT');}lines.push('END:VCALENDAR');return lines.map(foldLine).join('\r\n')+'\r\n';}
 export function encodeBase64(s){const bytes=new TextEncoder().encode(s);let out='';for(let i=0;i<bytes.length;i+=8192)out+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(out);}
 export function decodeBase64(s){return new TextDecoder().decode(Uint8Array.from(atob(s.replace(/\s/g,'')),c=>c.charCodeAt(0)));}
 export class GitHubStore{
